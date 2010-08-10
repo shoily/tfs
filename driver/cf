@@ -1,0 +1,2 @@
+dd if=/dev/zero of=myfs bs=1k count=1024
+../mkfs/a.out myfs
