@@ -163,7 +163,7 @@ err:
   return err;
 }
 
-int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_inode_info *tai, int *slot_page, int *slot_idx)
+int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_inode_info *tai)
 {
   int npages = (dir->i_size + PAGE_CACHE_SIZE -1) >> PAGE_CACHE_SHIFT;
   int i, lastbyte_in_page;
@@ -171,8 +171,8 @@ int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_i
   struct page *page;
   struct tfs_dentry *td;
 
-  *slot_page = -1;
-  *slot_idx = 0;
+  tai->slot_page = -1;
+  tai->slot_idx = 0;
 
   if (dentry->d_name.len > TFS_DENTRY_NAME_LEN)
     return -E2BIG;
@@ -198,10 +198,10 @@ int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_i
 	{
 	  if (!td->inode)
 	    {
-	      if (*slot_page == -1)
+	      if (tai->slot_page == -1)
 		{
-		  *slot_page = i;
-		  *slot_idx = (char *) td - addr;
+		  tai->slot_page = i;
+		  tai->slot_idx = (char *) td - addr;
 		}
 	      continue;
 	    }
@@ -209,8 +209,8 @@ int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_i
 	  if (td->len == dentry->d_name.len &&
 	      !memcmp(td->name, dentry->d_name.name, td->len))
 	    {
-	      *slot_page = i;
-	      *slot_idx = (char *) td - addr;
+	      tai->slot_page = i;
+	      tai->slot_idx = (char *) td - addr;
 	      kunmap(page);
 	      page_cache_release(page);
 	      
@@ -222,7 +222,7 @@ int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_i
       page_cache_release(page);
     }
 
-  if (*slot_page == -1)
+  if (tai->slot_page == -1)
     {
       return -ENOSPC;
     }
@@ -276,10 +276,12 @@ int tfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
   struct inode *inode_new = NULL;
   struct tfs_alloc_inode_info tai;
   int err = -EIO;
-  int free_slot_page = -1, free_slot_idx = 0;
 
   printk("TFS: tfs_mkdir: %u\n", (unsigned int) dir->i_ino);
-  err = tfs_find_dentry(dir, dentry, &tai, &free_slot_page, &free_slot_idx);
+
+  tfs_init_alloc_inode_info(tai);
+
+  err = tfs_find_dentry(dir, dentry, &tai);
   if (err)
     {
       printk("TFS: error in tfs_find_dentry: %d\n", err);
@@ -308,7 +310,7 @@ int tfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
 
   printk("TFS: tfs_new_default_dentry successful\n");
 
-  err = tfs_set_link(dir, inode_new, dentry, free_slot_page, free_slot_idx);
+  err = tfs_set_link(dir, inode_new, dentry, tai.slot_page, tai.slot_idx);
   if (err)
     {
       printk("TFS: error tfs_set_link: %d\n", err);
@@ -317,8 +319,8 @@ int tfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
 
   printk("TFS: tfs_set_link successful\n");
 
-  d_instantiate(dentry, inode_new);
   inode_inc_link_count(inode_new);
+  d_instantiate(dentry, inode_new);
   tfs_release_inode_info_blocks(&tai);
 
   return 0;
@@ -335,8 +337,55 @@ err_dec_inode:
   goto err;
 }
 
+int tfs_create(struct inode *dir, struct dentry *dentry, int mode, struct nameidata *nd)
+{
+  struct tfs_alloc_inode_info tai;
+  struct inode *inode_new = NULL;
+  int err;
+
+  printk("TFS: tfs_create: %u\n", (unsigned int) dir->i_ino);
+
+  tfs_init_alloc_inode_info(tai);
+
+  err = tfs_find_dentry(dir, dentry, &tai);
+  if (err)
+    {
+      printk("TFS: error tfs_create in tfs_find_dentry\n");
+      return -EIO;
+    }
+
+  inode_new = tfs_new_inode(dir, &tai, S_IFREG | mode);
+  if (!inode_new)
+    {
+      printk("TFS: error in tfs_new_inode\n");
+      goto err;
+    }
+
+  err = tfs_set_link(dir, inode_new, dentry, tai.slot_page, tai.slot_idx);
+  if (err)
+    {
+      printk("TFS: error in tfs_set_link\n");
+      goto err_dec_link;
+    }
+
+  d_instantiate(dentry, inode_new);
+  tfs_release_inode_info_blocks(&tai);
+
+  return 0;
+ 
+err:
+  tfs_error_inode_info(&tai);
+  iput(inode_new);
+  return err;
+
+err_dec_link:
+  inode_dec_link_count(inode_new);
+  goto err;
+}
+
 struct inode_operations tfs_dir_inode_operations =
   {
+    .create = tfs_create,
     .mkdir = tfs_mkdir,
     .lookup = tfs_lookup
   };
