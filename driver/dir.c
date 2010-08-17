@@ -267,6 +267,12 @@ int tfs_set_link(struct inode *dir, struct inode *inode, struct dentry *dentry, 
 
   err = tfs_commit_write(page, (slot_page << PAGE_CACHE_SHIFT) | slot_idx, sizeof(struct tfs_dentry));
   page_cache_release(page);
+
+  if (!err)
+    {
+      dir->i_ctime = dir->i_mtime = CURRENT_TIME_SEC;
+      mark_inode_dirty(dir);
+    }
   
   return err;
 }
@@ -319,6 +325,7 @@ int tfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
 
   printk("TFS: tfs_set_link successful\n");
 
+  
   inode_inc_link_count(inode_new);
   d_instantiate(dentry, inode_new);
   tfs_release_inode_info_blocks(&tai);
@@ -383,11 +390,52 @@ err_dec_link:
   goto err;
 }
 
+int tfs_link(struct dentry *source_dentry, struct inode *dir, struct dentry *dentry)
+{
+  struct tfs_alloc_inode_info tai;
+  struct inode *inode = source_dentry->d_inode;
+  int err;
+
+  printk("TFS: tfs_link: %u\n", (unsigned int) inode->i_ino);
+
+  tfs_init_alloc_inode_info(tai);
+
+  err = tfs_find_dentry(dir, source_dentry, &tai);
+  if (err != -EEXIST)
+    {
+      printk("TFS: Could not find source dentry: %d\n", err);
+      return err;
+    }
+
+  err = tfs_find_dentry(dir, dentry, &tai);
+  if (err)
+    {
+      printk("TFS: link may already exist: %d\n", err);
+      return err;
+    }
+
+  err = tfs_set_link(dir, inode, dentry, tai.slot_page, tai.slot_idx);
+  if (err)
+    {
+      printk("TFS: error in tfs_set_link: %d\n", err);
+      return err;
+    }
+
+  inode->i_ctime = CURRENT_TIME_SEC;
+  inode_inc_link_count(inode);
+  atomic_inc(&inode->i_count);
+  mark_inode_dirty(inode);
+  d_instantiate(dentry, inode);
+
+  return 0;
+}
+
 struct inode_operations tfs_dir_inode_operations =
   {
     .create = tfs_create,
     .mkdir = tfs_mkdir,
-    .lookup = tfs_lookup
+    .lookup = tfs_lookup,
+    .link = tfs_link
   };
 
 struct file_operations tfs_dir_operations =
