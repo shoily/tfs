@@ -36,6 +36,7 @@ static struct dentry *tfs_lookup(struct inode *dir, struct dentry *dentry, struc
 	{
 	  if (!td->inode || td->len != dentry->d_name.len)
 	    continue;
+
 	  if (!memcmp(td->name, dentry->d_name.name, td->len))
 	    {
 	      int ino = td->inode;
@@ -185,13 +186,9 @@ int tfs_find_dentry(struct inode *dir, struct dentry *dentry, struct tfs_alloc_i
 
       kmap(page);
       if (i != (npages - 1) || dir->i_size == PAGE_CACHE_SIZE)
-	{
-	  lastbyte_in_page = PAGE_CACHE_SIZE;
-	}
+	lastbyte_in_page = PAGE_CACHE_SIZE;
       else
-	{
-	  lastbyte_in_page = dir->i_size % PAGE_CACHE_SIZE;
-	}
+	lastbyte_in_page = dir->i_size % PAGE_CACHE_SIZE;
 
       addr = page_address(page);
       for (td = (struct tfs_dentry *) addr; (char *) td < (addr + lastbyte_in_page); ++td)

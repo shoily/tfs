@@ -112,6 +112,12 @@ static int tfs_get_sb(struct file_system_type *fs_type, int flags, const char *d
 static void init_once(void *foo)
 {
   struct tfs_inode_info *ti = (struct tfs_inode_info *) foo;
+  int i;
+
+  mutex_init(&ti->cached_block_mutex);
+  for (i = 0; i < TFS_BLK_GRP; ++i)
+    seqlock_init(&ti->cached_block_seqlocks[i]);
+
   inode_init_once(&ti->inode);
 }
 
@@ -180,6 +186,7 @@ static int tfs_write_inode(struct inode *inode, int wait)
   memset(ti->pad, 0, sizeof(ti->pad));
   for (i = 0; i < TFS_DATA_BLOCKS_PER_INODE; ++i)
     ti->data_blocks[i] = tinfo->data_blocks[i];
+  ti->root_indirect_data_block = tinfo->root_indirect_data_block;
 
   mark_buffer_dirty(bh);
   if (wait)

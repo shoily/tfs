@@ -57,7 +57,8 @@ struct tfs_inode
   u32 size;
   u32 blocks;
   u32 data_blocks[TFS_DATA_BLOCKS_PER_INODE];
-  char pad[12];
+  u32 root_indirect_data_block;
+  char pad[8];
 };
 
 #define TFS_DENTRY_NAME_LEN 20

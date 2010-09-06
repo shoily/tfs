@@ -16,49 +16,43 @@ void tfs_error_inode_info(struct tfs_alloc_inode_info *tainfo)
     *tainfo->inode_bitmap_data &= ~(1 << tainfo->inode_index);
 
   if (tainfo->datablock_bitmap_data)
-    *tainfo->datablock_bitmap_data &= ~((1 << tainfo->datablock_index) | (1 << (tainfo->datablock_index + 1)) | (1 << (tainfo->datablock_index + 2)) | (1 << (tainfo->datablock_index + 3)));
+    *tainfo->datablock_bitmap_data &= ~(1 << tainfo->datablock_index);
 
   tfs_release_inode_info_blocks(tainfo);
 }
 
-struct inode *tfs_new_inode(struct inode *dir, struct tfs_alloc_inode_info *tainfo, int mode)
+int alloc_inode_bitmap(struct super_block *sb, struct tfs_alloc_inode_info *tainfo)
 {
-  struct inode *inode_new;
-  struct super_block *sb = dir->i_sb;
-  struct tfs_sb_info *si = sb->s_fs_info;
+  struct tfs_sb_info *si = sb->s_fs_info; 
   struct tfs_super_block *tsb = si->super_block;
-  struct tfs_inode *ti;
-  unsigned char *inode_bitmap_data = NULL, *datablock_bitmap_data = NULL;
+  unsigned long *inode_bitmap_data = NULL;
+  int ret = 0;
   unsigned int i, j, k;
-  unsigned int block, offset, shift;
-  int err;
 
-  memset(tainfo, 0, sizeof(*tainfo));
-  
   mutex_lock(&si->inode_bitmap_mutex);
   for (i = 0; i < tsb->inode_bitmap_blocks; ++i)
     {
       tainfo->inode_bitmap_bh = sb_bread(sb, tsb->inode_bitmap_block_start + i);
       if (!tainfo->inode_bitmap_bh)
 	{
-	  err = -EIO;
+	  ret = -EIO;
 	  printk("TFS: error !tainfo->inode_bitmap_bh\n");
-	  goto err;
+	  goto inode_unlock;
 	}
-      inode_bitmap_data = tainfo->inode_bitmap_bh->b_data;
+      inode_bitmap_data = (unsigned long *) tainfo->inode_bitmap_bh->b_data;
 
       for (j = 0; j < TFS_BLOCK_SIZE; ++j, ++inode_bitmap_data)
 	{
-	  if (*inode_bitmap_data == 0xFF)
+	  if (*inode_bitmap_data == (unsigned long) -1)
 	    continue;
 
-	  for (k = 0; k < 8; ++k)
+	  for (k = 0; k < BITS_PER_LONG; ++k)
 	    {
 	      if ((1 << k) & *inode_bitmap_data)
 		continue;
 
 	      tainfo->inode_index = k;
-	      tainfo->ino = (i * TFS_BLOCK_SIZE) + (j * 8) + k;
+	      tainfo->ino = (i * TFS_BLOCK_SIZE) + (j * BITS_PER_LONG) + k;
 	      *inode_bitmap_data |= (1 << k);
 	      tainfo->inode_bitmap_data = inode_bitmap_data;
 	      goto inode_unlock;
@@ -71,12 +65,22 @@ struct inode *tfs_new_inode(struct inode *dir, struct tfs_alloc_inode_info *tain
 inode_unlock:
   mutex_unlock(&si->inode_bitmap_mutex);
 
-  if (!tainfo->ino)
+  if (!ret && !tainfo->ino)
     {
       printk("TFS: no more space for inode\n");
-      err = -ENOSPC;
-      goto err;
+      ret = -ENOSPC;
     }
+
+  return ret;
+}
+
+int alloc_datablock_bitmap(struct super_block *sb, struct tfs_alloc_inode_info *tainfo)
+{
+  struct tfs_sb_info *si = sb->s_fs_info; 
+  struct tfs_super_block *tsb = si->super_block;
+  unsigned long *datablock_bitmap_data = NULL;
+  int ret = 0;
+  unsigned int i, j, k;
 
   mutex_lock(&si->data_bitmap_mutex);
   for (i = 0; i < tsb->data_bitmap_blocks; ++i)
@@ -84,30 +88,28 @@ inode_unlock:
       tainfo->data_bitmap_bh = sb_bread(sb, tsb->data_bitmap_block_start + i);
       if (!tainfo->data_bitmap_bh)
 	{
-	  err = -EIO;
+	  ret = -EIO;
 	  printk("TFS: error !tainfo->data_bitmap_bh\n");
-	  goto err;
+	  goto data_unlock;
 	}
-      datablock_bitmap_data = tainfo->data_bitmap_bh->b_data;
+      datablock_bitmap_data = (unsigned long *) tainfo->data_bitmap_bh->b_data;
 
       for (j = 0; j < TFS_BLOCK_SIZE; ++j, ++datablock_bitmap_data)
 	{
-	  if (*datablock_bitmap_data == 0xFF)
+	  if (*datablock_bitmap_data == (unsigned long) -1)
 	    continue;
 
-	  for (k = 0; k < 8; k += 4)
+	  for (k = 0; k < BITS_PER_LONG; ++k)
 	    {
-	      unsigned char mask = (1 << k) | (1 << (k + 1)) | (1 << (k + 2)) | (1 << (k + 3));
-	      if (mask & *datablock_bitmap_data)
+	      if ((1 << k) & *datablock_bitmap_data)
 		continue;
 
 	      tainfo->datablock_index = k;
-	      tainfo->data_block = (i * TFS_BLOCK_SIZE) + (j * 8) + k;
-	      *datablock_bitmap_data |= (1 << k) | (1 << (k + 1)) | (1 << (k + 2)) | (1 << (k + 3));
+	      tainfo->data_block = (i * TFS_BLOCK_SIZE) + (j * BITS_PER_LONG) + k;
+	      *datablock_bitmap_data |= (1 << k);
 	      tainfo->datablock_bitmap_data = datablock_bitmap_data;
 
 	      printk("TFS: datablock: %u\n", tainfo->data_block);
-
 	      goto data_unlock;
 	    }
 	}
@@ -118,11 +120,34 @@ inode_unlock:
 data_unlock:
   mutex_unlock(&si->data_bitmap_mutex);
 
-  if (!tainfo->data_block)
+  if (!ret && !tainfo->data_block)
     {
       printk("TFS: no more space for data block\n");
-      err = -ENOSPC;
+      ret = -ENOSPC;
+    }
+
+  return ret;
+}
+
+struct inode *tfs_new_inode(struct inode *dir, struct tfs_alloc_inode_info *tainfo, int mode)
+{
+  struct inode *inode_new;
+  struct super_block *sb = dir->i_sb;
+  struct tfs_sb_info *si = sb->s_fs_info;
+  struct tfs_super_block *tsb = si->super_block;
+  struct tfs_inode *ti;
+  unsigned int block, offset, shift;
+  int err, i;
+
+  err = alloc_inode_bitmap(sb, tainfo);
+  if (err)
       goto err;
+
+  if (mode & S_IFDIR)
+    {
+      err = alloc_datablock_bitmap(sb, tainfo);
+      if (err)
+	goto err;
     }
 
   shift = (tainfo->ino << TFS_INODE_SIZE_BITS);
@@ -143,14 +168,25 @@ data_unlock:
   ti->gid = dir->i_gid;
   ti->ctime = ti->mtime = ti->atime = CURRENT_TIME_SEC.tv_sec;
   ti->hard_link_count = 1;
-  ti->size = TFS_BLOCK_SIZE * TFS_DATA_BLOCKS_PER_INODE;
-  ti->blocks = TFS_DATA_BLOCKS_PER_INODE;
+
   for (i = 0; i < TFS_DATA_BLOCKS_PER_INODE; ++i)
-    ti->data_blocks[i] = tainfo->data_block + i;
+    ti->data_blocks[i] = 0;
+
+  if (mode & S_IFDIR)
+    {
+      ti->size = TFS_BLOCK_SIZE;
+      ti->blocks = 1;
+      ti->data_blocks[0] = tainfo->data_block;
+      mark_buffer_dirty(tainfo->data_bitmap_bh);
+    }
+  else
+    {
+      ti->size = 0;
+      ti->blocks = 0;
+    }
 
   mark_buffer_dirty(tainfo->inode_table_bh);
   mark_buffer_dirty(tainfo->inode_bitmap_bh);
-  mark_buffer_dirty(tainfo->data_bitmap_bh);
 
   inode_new = tfs_inode_get(sb, tainfo->ino);
   if (IS_ERR(inode_new))

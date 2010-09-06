@@ -7,6 +7,10 @@
 #include <linux/fs.h>
 #include <linux/buffer_head.h>
 #include <linux/mutex.h>
+#include <linux/seqlock.h>
+
+#define TFS_BLK_GRP 2
+#define TFS_BLK_PER_GRP 4
 
 struct tfs_sb_info
 {
@@ -14,12 +18,17 @@ struct tfs_sb_info
   struct buffer_head *bh;
   struct mutex inode_bitmap_mutex;
   struct mutex data_bitmap_mutex;
-  struct mutex inode_buffer_mutex;
 };
 
 struct tfs_inode_info
 {
-  unsigned int data_blocks[TFS_DATA_BLOCKS_PER_INODE];
+  sector_t data_blocks[TFS_DATA_BLOCKS_PER_INODE];
+  sector_t cached_first_logical_blocks[TFS_BLK_GRP];
+  sector_t cached_data_blocks[TFS_BLK_GRP][TFS_BLK_PER_GRP];
+  seqlock_t cached_block_seqlocks[TFS_BLK_GRP];
+  sector_t root_indirect_data_block;
+  int cached_next_slot;
+  struct mutex cached_block_mutex;
   struct inode inode;
 };
 

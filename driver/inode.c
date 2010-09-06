@@ -11,6 +11,7 @@
 #include <linux/time.h>
 
 #include "tfs_module.h"
+#include "alloc.h"
 
 static const struct address_space_operations tfs_aops;
 extern struct file_operations tfs_file_operations;
@@ -75,6 +76,9 @@ struct inode *tfs_inode_get(struct super_block *sb, int ino)
   for (i = 0; i < TFS_DATA_BLOCKS_PER_INODE; ++i)
     ti->data_blocks[i] = tfs_inode->data_blocks[i];
 
+  ti->root_indirect_data_block = tfs_inode->root_indirect_data_block;
+  ti->cached_next_slot = 0;
+
   //TODO: implement setattr
   if (S_ISREG(inode->i_mode))
     {
@@ -121,25 +125,296 @@ int tfs_sync_inode(struct inode *inode)
   return sync_inode(inode, &wbc);
 }
 
+#define TFS_BLOCK_FOUND 1
+#define TFS_BLOCK_NOT_FOUND 2
+
 int tfs_getblocks(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 {
   int i;
   int count = 0;
   struct tfs_inode_info *ti = TFS_INODE(inode);
+  sector_t blocknum;
+  unsigned seq;
+  size_t bsize = 0;
+  int status;
+  int err = 0;
+  struct tfs_alloc_inode_info tainfo;
+  unsigned blkbits = inode->i_blkbits;
+  unsigned blocks_per_page = PAGE_CACHE_SIZE >> blkbits;
+  sector_t last_block_in_file = (i_size_read(inode) + blocks_per_page) >> blkbits;
 
-  printk("TFS: tfs_getblocks - %u, %u\n", (unsigned)iblock, bh_result->b_size);
+  printk("TFS: tfs_getblocks - block=%u, req size=%u\n", (unsigned)iblock, bh_result->b_size);
 
-  if (iblock >= TFS_DATA_BLOCKS_PER_INODE)
-    return -EINVAL;
+  if (iblock < TFS_DATA_BLOCKS_PER_INODE)
+    {
+      if (iblock > last_block_in_file)
+	{
+	  if (!create)
+	    return -EINVAL;
+	  else 
+	    goto alloc_directblock;
+	}
 
-  for (i = iblock; i < TFS_DATA_BLOCKS_PER_INODE && i < (bh_result->b_size >> inode->i_blkbits); ++i, ++count);
+      count = 0;
+      blocknum = iblock;
+      while (blocknum < TFS_DATA_BLOCKS_PER_INODE &&
+	     count < (bh_result->b_size >> inode->i_blkbits) &&
+	     ti->data_blocks[blocknum] &&
+	     (!count || ti->data_blocks[blocknum] == (ti->data_blocks[blocknum - 1] + 1)))
+	{
+	  ++blocknum;
+	  ++count;
+	}
 
-  map_bh(bh_result, inode->i_sb, ti->data_blocks[iblock]);
-  bh_result->b_size = count << inode->i_blkbits;
+      if (!count)
+	{
+	  if (!create)
+	      return -EINVAL;
+	  else
+	    goto alloc_directblock;
+	}
 
-  printk("TFS: mapped %u, %u\n", bh_result->b_size, ti->data_blocks[iblock]);
+      map_bh(bh_result, inode->i_sb, ti->data_blocks[iblock]);
+      bh_result->b_size = count << inode->i_blkbits;
+
+      printk("TFS: mapped: data block=%u, size=%u\n", (unsigned) ti->data_blocks[iblock], bh_result->b_size);
+
+      return 0;
+
+alloc_directblock:
+      tfs_init_alloc_inode_info(tainfo);
+
+      err = alloc_datablock_bitmap(inode->i_sb, &tainfo);
+      if (err)
+	goto error_alloc;
+      
+      ti->data_blocks[iblock] = tainfo.data_block;
+      inode->i_blocks++;
+      mark_inode_dirty(inode);
+
+      map_bh(bh_result, inode->i_sb, tainfo.data_block);
+      bh_result->b_size = 1 << inode->i_blkbits;
+
+      printk("TFS: mapped data block=%u, size=%u\n", (unsigned) tainfo.data_block, bh_result->b_size);
+
+      tfs_release_inode_info_blocks(&tainfo);
+    }
+  else
+    {
+      sector_t first_rounded_logical_block = iblock - (iblock % TFS_BLK_PER_GRP);
+      sector_t first_rounded_relative_block = (iblock - TFS_DATA_BLOCKS_PER_INODE) - ((iblock - TFS_DATA_BLOCKS_PER_INODE) % TFS_BLK_PER_GRP);
+      u32 rounded_block_index;
+      sector_t rid_block, indirect_block, block;
+      u32 indirect_block_index, block_index;
+      struct buffer_head *rid_bh = NULL, *id_bh = NULL;
+
+      printk("TFS: first rounded block=%u, relative block=%u, blocknum=%u\n", (unsigned) first_rounded_logical_block, (unsigned) first_rounded_relative_block, (unsigned) (iblock - TFS_DATA_BLOCKS_PER_INODE));
+
+      if (iblock > last_block_in_file)
+	{
+	  if (!create)
+	    return -EINVAL;
+	  else 
+	    goto alloc_indirectblock;
+	}
+
+      for (i = 0; i < TFS_BLK_GRP; ++i)
+	{
+	  sector_t *pblock = &ti->cached_data_blocks[i][0];
+	  count = 0;
+	  blocknum = iblock - TFS_DATA_BLOCKS_PER_INODE;
+	  printk("TFS: cached_first_logical_block[%d]=%u, first block=%u\n", i, (unsigned) ti->cached_first_logical_blocks[i], (unsigned) pblock[blocknum - first_rounded_relative_block]);
+	  seq = read_seqbegin(&ti->cached_block_seqlocks[i]);
+	  if (first_rounded_logical_block == ti->cached_first_logical_blocks[i] && pblock[blocknum - first_rounded_relative_block])
+	    {
+	      status = TFS_BLOCK_FOUND;
+	      while (count < (bh_result->b_size >> inode->i_blkbits) &&
+		     (blocknum - first_rounded_relative_block) < TFS_BLK_PER_GRP &&
+		     pblock[blocknum - first_rounded_relative_block] &&
+		     (!count || (pblock[blocknum - first_rounded_relative_block] == pblock[blocknum - first_rounded_relative_block - 1] + 1)))
+		{
+		  ++blocknum;
+		  ++count;
+		}
+	      bsize = count << inode->i_blkbits;
+	    }
+	  else
+	    {
+	      status = TFS_BLOCK_NOT_FOUND;
+	    }
+
+	  if (read_seqretry(&ti->cached_block_seqlocks[i], seq) && status == TFS_BLOCK_FOUND)
+	    break;
+
+	  if (status == TFS_BLOCK_FOUND)
+	    {
+	      map_bh(bh_result, inode->i_sb, pblock[iblock - TFS_DATA_BLOCKS_PER_INODE - first_rounded_relative_block]);
+	      bh_result->b_size = bsize;
+
+	      printk("TFS: mapped: data block=%u, size=%u\n", (unsigned) bh_result->b_blocknr, bsize);
+	      return 0;
+	    }
+	}
+
+alloc_indirectblock:
+      
+      if (create && !ti->root_indirect_data_block)
+	{
+	  tfs_init_alloc_inode_info(tainfo);
+	  err = alloc_datablock_bitmap(inode->i_sb, &tainfo);
+	  if (err)
+	    {
+	      printk("TFS: error allocating root indirect data block: %d\n", err);
+	      goto error_alloc;
+	    }
+
+	  printk("TFS: allocated root indirect data block: %u\n", tainfo.data_block);
+	  ti->root_indirect_data_block = tainfo.data_block;
+	  inode->i_blocks++;
+	  mark_inode_dirty(inode);
+	  tfs_release_inode_info_blocks(&tainfo);
+	}
+      rid_block = ti->root_indirect_data_block;
+
+      if (!rid_block)
+	{
+	  printk("TFS: root indirect data block cannot be 0");
+	  return -EINVAL;
+	}
+      printk("TFS: root indirect block: %u\n", (unsigned) rid_block);
+
+      rid_bh = sb_bread(inode->i_sb, rid_block);
+      if (!rid_bh)
+	{
+	  printk("TFS: error reading root indirect data block: %u\n", (unsigned) rid_block);
+	  return -EIO;
+	}
+
+      indirect_block_index = (iblock - TFS_DATA_BLOCKS_PER_INODE) / (TFS_BLOCK_SIZE / sizeof(u32));
+      if (indirect_block_index >= TFS_BLOCK_SIZE / sizeof(u32))
+	{
+	  printk("TFS: invalid indirect block index: %u\n", indirect_block_index);
+	  brelse(rid_bh);
+	  return -EINVAL;
+	}
+
+      printk("TFS: indirect_block_index: %u\n", indirect_block_index);
+
+      indirect_block = (sector_t) *((u32 *) rid_bh->b_data + indirect_block_index);
+      if (create && !indirect_block)
+	{
+	  tfs_init_alloc_inode_info(tainfo);
+	  err = alloc_datablock_bitmap(inode->i_sb, &tainfo);
+	  if (err)
+	    {
+	      printk("TFS: error allocating indirect data block: %d\n", err);
+	      brelse(rid_bh);
+	      goto error_alloc;
+	    }
+
+	  printk("TFS: allocated indirect data block: %u\n", tainfo.data_block);
+	  *((u32 *) rid_bh->b_data + indirect_block_index) = indirect_block = tainfo.data_block;
+	  mark_buffer_dirty(rid_bh);
+	  inode->i_blocks++;
+	  mark_inode_dirty(inode);
+	  tfs_release_inode_info_blocks(&tainfo);
+	}
+      brelse(rid_bh);
+      if (!indirect_block)
+	{
+	  printk("TFS: indirect block cannot be 0\n");
+	  return -EINVAL;
+	}
+
+      printk("TFS: indirect block: %u\n", (unsigned) indirect_block);
+
+      id_bh = sb_bread(inode->i_sb, indirect_block);
+      if (!id_bh)
+	{
+	  printk("TFS: error reading indirect block: %u\n", (unsigned) indirect_block);
+	  return -EIO;
+	}
+      block_index = (iblock - TFS_DATA_BLOCKS_PER_INODE) % (TFS_BLOCK_SIZE / sizeof(u32));
+      if (block_index >= (TFS_BLOCK_SIZE / sizeof(u32)))
+	{
+	  printk("TFS: invalid block index: %u\n", block_index);
+	  brelse(id_bh);
+	  return -EINVAL;
+	}
+
+      printk("TFS: block_index: %u\n", block_index);
+
+      block = (sector_t) *((u32 *) id_bh->b_data + block_index);
+      if (create && !block)
+	{
+	  tfs_init_alloc_inode_info(tainfo);
+	  err = alloc_datablock_bitmap(inode->i_sb, &tainfo);
+	  if (err)
+	    {
+	      printk("TFS: error allocating data block: %d\n", err);
+	      brelse(id_bh);
+	      goto error_alloc;
+	    }
+
+	  printk("TFS: allocated data block: %u\n", tainfo.data_block);
+	  *((u32 *) id_bh->b_data + block_index) = block = tainfo.data_block;
+	  mark_buffer_dirty(id_bh);
+	  inode->i_blocks++;
+	  mark_inode_dirty(inode);
+	  tfs_release_inode_info_blocks(&tainfo);
+	}
+      
+      if (!block)
+	{
+	  printk("TFS: block cannot be 0\n");
+	  brelse(id_bh);
+	  return -EINVAL;
+	}
+
+      printk("TFS: data block: %u\n", (unsigned) block);
+
+      map_bh(bh_result, inode->i_sb, block);
+      bh_result->b_size = 1 << inode->i_blkbits;
+      printk("TFS: mapped data block=%u, size=%u\n", (unsigned) block, bh_result->b_size);
+
+      mutex_lock(&ti->cached_block_mutex);
+
+      for (i = 0; i < TFS_BLK_GRP; ++i)
+	{
+	  if (first_rounded_logical_block == ti->cached_first_logical_blocks[i])
+	    {
+	      ti->cached_next_slot = i;
+	      break;
+	    }
+	}
+
+      if (ti->cached_next_slot == TFS_BLK_GRP)
+	ti->cached_next_slot = 0;
+
+      rounded_block_index = first_rounded_relative_block % (TFS_BLOCK_SIZE / sizeof(u32));
+      printk("TFS: rounded block index: %u, next slot: %u\n", rounded_block_index, ti->cached_next_slot);
+
+      write_seqlock(&ti->cached_block_seqlocks[ti->cached_next_slot]);
+      ti->cached_first_logical_blocks[ti->cached_next_slot] = first_rounded_logical_block;
+
+      for (i = 0; i < TFS_BLK_PER_GRP; ++i)
+	{
+	  ti->cached_data_blocks[ti->cached_next_slot][i] = (sector_t) *(((u32 *) id_bh->b_data) + rounded_block_index + i);
+	  printk("TFS: cached data blocks[%d]=%u\n", i, (unsigned) ti->cached_data_blocks[ti->cached_next_slot][i]);
+	}
+
+      write_sequnlock(&ti->cached_block_seqlocks[ti->cached_next_slot]);
+      ti->cached_next_slot++;
+
+      mutex_unlock(&ti->cached_block_mutex);
+
+      brelse(id_bh);
+    }
 
   return 0;
+error_alloc:
+  tfs_error_inode_info(&tainfo);
+  return err;
 }
 
 
@@ -151,7 +426,7 @@ static int tfs_readpages(struct file *file, struct address_space *mapping, struc
 
 static int tfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
-  printk("TFS: tfs_writepages: %u\n", (unsigned int) mapping->host->i_ino);
+  printk("TFS: tfs_writepages: %u, %u\n", (unsigned int) mapping->host->i_ino, (unsigned) wbc->nr_to_write);
   return mpage_writepages(mapping, wbc, tfs_getblocks);
 }
 
