@@ -78,6 +78,8 @@ struct inode *tfs_inode_get(struct super_block *sb, int ino)
 
   ti->root_indirect_data_block = tfs_inode->root_indirect_data_block;
   ti->cached_next_slot = 0;
+  memset(ti->cached_first_logical_blocks, 0, sizeof(ti->cached_first_logical_blocks));
+  memset(ti->cached_data_blocks, 0, sizeof(ti->cached_data_blocks));
 
   //TODO: implement setattr
   if (S_ISREG(inode->i_mode))
@@ -140,14 +142,13 @@ int tfs_getblocks(struct inode *inode, sector_t iblock, struct buffer_head *bh_r
   int err = 0;
   struct tfs_alloc_inode_info tainfo;
   unsigned blkbits = inode->i_blkbits;
-  unsigned blocks_per_page = PAGE_CACHE_SIZE >> blkbits;
-  sector_t last_block_in_file = (i_size_read(inode) + blocks_per_page) >> blkbits;
+  sector_t last_block_in_file = (i_size_read(inode) + TFS_BLOCK_SIZE - 1) >> blkbits;
 
-  printk("TFS: tfs_getblocks - block=%u, req size=%u\n", (unsigned)iblock, bh_result->b_size);
+  printk("TFS: tfs_getblocks - block=%u, req size=%u, lblock=%u\n", (unsigned)iblock, bh_result->b_size, (unsigned)last_block_in_file);
 
   if (iblock < TFS_DATA_BLOCKS_PER_INODE)
     {
-      if (iblock > last_block_in_file)
+      if (iblock >= last_block_in_file)
 	{
 	  if (!create)
 	    return -EINVAL;
@@ -210,7 +211,7 @@ alloc_directblock:
 
       printk("TFS: first rounded block=%u, relative block=%u, blocknum=%u\n", (unsigned) first_rounded_logical_block, (unsigned) first_rounded_relative_block, (unsigned) (iblock - TFS_DATA_BLOCKS_PER_INODE));
 
-      if (iblock > last_block_in_file)
+      if (iblock >= last_block_in_file)
 	{
 	  if (!create)
 	    return -EINVAL;

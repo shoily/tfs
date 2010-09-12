@@ -252,7 +252,6 @@ static int tfs_show_options(struct seq_file *seqfile, struct vfsmount *mnt)
   struct tfs_sb_info *si = sb->s_fs_info;
   struct tfs_super_block *tsb = si->super_block;
 
-  printk("TFS: tfs_show_options\n");
   seq_printf(seqfile, "TFS: inode bitmap blocks=%u\n", (unsigned int) tsb->inode_bitmap_blocks);
 
   return 0;
